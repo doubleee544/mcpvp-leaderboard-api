@@ -1,83 +1,94 @@
 
-const SOURCE = "https://www.mcpvp.com/tiers";
+const SOURCE = "https://www.mcpvp.com/tiers/data";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname !== "/leaderboard") {
-      return Response.json({
-        error: "Use /leaderboard"
-      }, { status: 404 });
+      return Response.json({ error: "Use /leaderboard" }, {
+        status: 404
+      });
     }
 
-    const cache = caches.default;
-    const cacheKey = new Request(
-      "https://mcpvp-cache.local/leaderboard"
-    );
-
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-
     try {
-      const res = await fetch(SOURCE, {
+      const upstream = await fetch(SOURCE, {
         headers: {
-          "User-Agent": "Mozilla/5.0",
-          "Accept": "text/html"
+          "Accept": "application/json",
+          "User-Agent": "Mozilla/5.0"
         }
       });
 
-      if (!res.ok) {
-        throw new Error("MCPVP returned " + res.status);
+      if (!upstream.ok) {
+        throw new Error("MCPVP HTTP " + upstream.status);
       }
 
-      const html = await res.text();
-
-      const matches = [...html.matchAll(
-        /<a\b[^>]*href=["']\/@([^"'?#]+)["'][^>]*>([\s\S]*?)<\/a>/gi
-      )];
-
+      const payload = await upstream.json();
       const players = [];
       const seen = new Set();
 
-      for (let i = 0; i < matches.length; i++) {
-        const match = matches[i];
-        const username = match[1];
+      function add(raw, forcedName) {
+        if (!raw || typeof raw !== "object" ||
+            Array.isArray(raw)) return;
 
-        if (!/^[a-zA-Z0-9_]{2,20}$/.test(username)) {
-          continue;
-        }
+        const name = forcedName ||
+          raw.name || raw.username ||
+          raw.player || raw.ign;
 
-        if (seen.has(username.toLowerCase())) continue;
+        if (!name) return;
 
-        const start = match.index + match[0].length;
-        const next = matches[i + 1]?.index ?? html.length;
-
-        const section = html.slice(start, next);
-        const text = section.replace(/<[^>]*>/g, " ")
-          .replace(/&nbsp;/g, " ")
-          .replace(/&#39;/g, "'")
-          .replace(/&amp;/g, "&");
-
-        const pointsMatch = text.match(
-          /([\d,]+(?:\.\d+)?)\s*Points/i
+        const points = Number(
+          raw.points ??
+          raw.totalPoints ??
+          raw.score ??
+          raw.rating
         );
 
-        if (!pointsMatch) continue;
+        if (!Number.isFinite(points)) return;
 
-        const originalPoints = Number(
-          pointsMatch[1].replace(/,/g, "")
-        );
+        const key = String(name).toLowerCase();
+        if (seen.has(key)) return;
 
-        if (!Number.isFinite(originalPoints)) continue;
-
-        seen.add(username.toLowerCase());
+        seen.add(key);
 
         players.push({
-          username,
-          originalPoints,
-          points: originalPoints / 10
+          username: String(name),
+          originalPoints: points,
+          points: points / 10,
+          region: raw.region ?? raw.reg ?? null
         });
+      }
+
+      function walk(value, key = "") {
+        if (!value || typeof value !== "object") return;
+
+        if (Array.isArray(value)) {
+          value.forEach(item => walk(item));
+          return;
+        }
+
+        if (value.name || value.username ||
+            value.player || value.ign) {
+          add(value);
+        }
+
+        if (/^[A-Za-z0-9_]{2,20}$/.test(key)) {
+          add(value, key);
+        }
+
+        for (const [k, v] of Object.entries(value)) {
+          if (v && typeof v === "object") {
+            walk(v, k);
+          }
+        }
+      }
+
+      walk(payload);
+
+      if (players.length === 0) {
+        throw new Error(
+          "No players found. MCPVP data structure may have changed."
+        );
       }
 
       players.sort(
@@ -91,16 +102,9 @@ export default {
         })
       );
 
-      if (top100.length !== 100) {
-        throw new Error(
-          "Only found " + top100.length +
-          " players. Expected 100."
-        );
-      }
-
-      const response = Response.json({
+      return Response.json({
         success: true,
-        leaderboard: "MCPVP BETA OVERALL",
+        source: "MCPVP BETA OVERALL",
         updatedAt: new Date().toISOString(),
         count: top100.length,
         players: top100
@@ -111,22 +115,11 @@ export default {
         }
       });
 
-      ctx.waitUntil(
-        cache.put(cacheKey, response.clone())
-      );
-
-      return response;
-
     } catch (error) {
       return Response.json({
         success: false,
         error: error.message
-      }, {
-        status: 502,
-        headers: {
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
+      }, { status: 502 });
     }
   }
 };
